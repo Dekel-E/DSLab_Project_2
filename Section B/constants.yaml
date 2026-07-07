@@ -1,0 +1,25 @@
+# Instructor configuration — do NOT submit this file with your assignment.
+# Grading uses the course staff copy of this file and data artifacts.
+
+epochs: 100
+accuracy_threshold: 0.79
+section_b_points: 40
+seeds: [1, 2, 3]
+
+optimizer:
+  lr: 0.01
+  weight_decay: 0.0005
+
+data:
+  nodes: data/nodes.csv
+  edges: data/edges.csv
+  subject_mapping: data/subject_mapping.pkl
+  indices_dict: data/indices_dict_part2.pkl
+
+allowed_imports:
+  - torch
+  - torch_geometric
+  - pandas
+  - numpy
+  - pickle
+  - typing

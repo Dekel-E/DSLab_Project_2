@@ -1,19 +1,88 @@
 """
 Student implementation file — submit this file only.
 
-Implement run_active_learning(seed) to run your active learning strategy and return
-a trained RandomForestClassifier. You may add helper functions in this file only.
+Strategy overview
+-----------------
+1. Start from the 500 free initial labels.
+2. Batch-mode uncertainty sampling: repeatedly train the fixed Random Forest,
+   score all remaining pool candidates, and query the oracle for the samples
+   whose predicted P(Left) is closest to the decision boundary, until the
+   oracle budget is exhausted (with runtime and budget guards).
+3. Rebalance for F1: the test metric is F1 of the minority "Left" class under
+   model.predict() (0.5 vote threshold). Duplicating positive training rows
+   shifts the effective threshold; the duplication ratio is chosen by
+   3-fold cross-validation on the labeled data only (never the test set).
+4. Train the final Random Forest on the labeled set + duplicated positives.
 
 Allowed imports: numpy, pandas, sklearn, scipy, collections, warnings, typing, utils
 """
 
 from __future__ import annotations
 
+import warnings
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import f1_score
+from sklearn.model_selection import StratifiedKFold
+
 from utils import (
+    call_oracle,
+    get_oracle_usage,
     load_initial_labeled,
+    load_pool,
     prepare_xy,
     train_model,
 )
+
+# Runtime guard: stop querying in time to leave room for the final
+# rebalancing CV + model fit (the hard limit is 60 s per seed).
+_SOFT_TIME_LIMIT_SEC = 35.0
+_BATCH_SIZE = 500
+# Candidate duplication ratios (extra copies of each positive row).
+_DUP_RATIOS = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+
+
+def _encode(df: pd.DataFrame) -> pd.DataFrame:
+    """Encode unlabeled rows with the framework's encoder (public API only)."""
+    work = df.copy()
+    work["Attrition"] = 0  # dummy label, discarded
+    X, _, _ = prepare_xy(work)
+    return X
+
+
+def _duplicate_positives(X, y, ids, dup: float):
+    """Append `dup` extra copies of the positive rows (tiled, deterministic)."""
+    pos_idx = np.where(y == 1)[0]
+    n_extra = int(round(dup * len(pos_idx)))
+    if n_extra == 0 or len(pos_idx) == 0:
+        return X, y, ids
+    reps = int(np.ceil(n_extra / len(pos_idx)))
+    idx = np.tile(pos_idx, reps)[:n_extra]
+    Xa = pd.concat([X, X.iloc[idx]], ignore_index=True)
+    ya = np.concatenate([y, y[idx]])
+    ida = np.concatenate([ids, ids[idx]])
+    return Xa, ya, ida
+
+
+def _fit(X, y, ids, seed):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # duplicate-ID warning is expected
+        return train_model(X, y, ids, seed=seed)
+
+
+def _pick_dup_ratio(X, y, ids, seed: int) -> float:
+    """Choose the positive-duplication ratio by 3-fold CV on labeled data."""
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=seed)
+    scores = {r: [] for r in _DUP_RATIOS}
+    for tr_idx, va_idx in skf.split(X, y):
+        Xtr, ytr, idtr = X.iloc[tr_idx], y[tr_idx], ids[tr_idx]
+        Xva, yva = X.iloc[va_idx], y[va_idx]
+        for r in _DUP_RATIOS:
+            Xa, ya, ida = _duplicate_positives(Xtr, ytr, idtr, r)
+            model = _fit(Xa, ya, ida, seed)
+            scores[r].append(f1_score(yva, model.predict(Xva), pos_label=1))
+    return max(_DUP_RATIOS, key=lambda r: float(np.mean(scores[r])))
 
 
 def run_active_learning(seed: int):
@@ -30,17 +99,45 @@ def run_active_learning(seed: int):
     sklearn.ensemble.RandomForestClassifier
         Trained model to be evaluated on the hidden test set.
     """
-    # --- TODO: implement your active learning strategy below ---
+    t_start = pd.Timestamp.now()
 
-    # 1. Start from the provided initial labeled set (500 samples, free budget).
     labeled = load_initial_labeled(seed)
+    pool = load_pool()
 
-    # 2. Iteratively select Employee IDs from the pool, call_oracle(ids), and retrain.
-    #    You may also add pseudo-labeled or augmented samples to training without
-    #    using the oracle, as long as you respect the oracle budget enforced by utils.
+    have = set(labeled["Employee ID"].astype(str))
+    cand = pool[~pool["Employee ID"].astype(str).isin(have)].reset_index(drop=True)
+    cand_ids = cand["Employee ID"].astype(str).to_numpy()
+    X_cand = _encode(cand)
 
-    # Example skeleton (replace with your strategy):
-    X_train, y_train, train_ids = prepare_xy(labeled)
-    model = train_model(X_train, y_train, train_ids, seed=seed)
+    budget = int(get_oracle_usage()["remaining"])
+    budget = min(budget, len(cand_ids))
 
-    return model
+    spent = 0
+    while spent < budget and len(cand_ids) > 0:
+        elapsed = (pd.Timestamp.now() - t_start).total_seconds()
+        if elapsed > _SOFT_TIME_LIMIT_SEC:
+            k = budget - spent  # out of time: spend the rest in one batch
+        else:
+            k = min(_BATCH_SIZE, budget - spent)
+        k = min(k, len(cand_ids))
+
+        X, y, ids = prepare_xy(labeled)
+        model = _fit(X, y, ids, seed)
+
+        proba = model.predict_proba(X_cand)[:, 1]
+        margin = np.abs(proba - 0.5)
+        take_idx = np.argsort(margin, kind="stable")[:k]
+
+        new_rows = call_oracle(list(cand_ids[take_idx]))
+        labeled = pd.concat([labeled, new_rows], ignore_index=True)
+        spent += k
+
+        keep = np.setdiff1d(np.arange(len(cand_ids)), take_idx)
+        cand_ids = cand_ids[keep]
+        X_cand = X_cand.iloc[keep].reset_index(drop=True)
+
+    # Final rebalanced model.
+    X, y, ids = prepare_xy(labeled)
+    dup = _pick_dup_ratio(X, y, ids, seed)
+    Xa, ya, ida = _duplicate_positives(X, y, ids, dup)
+    return _fit(Xa, ya, ida, seed)

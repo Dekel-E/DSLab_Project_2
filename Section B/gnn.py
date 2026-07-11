@@ -1,11 +1,5 @@
-"""
-Student implementation file — implement all TODO sections below.
-
-This is the only Section B file you should submit.
-"""
 
 from __future__ import annotations
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -14,13 +8,14 @@ from torch_geometric.nn import SAGEConv
 
 def get_feature_vectors(nodes_df):
     """Return node feature matrix x as a float torch.Tensor."""
-    # Each `features` cell is a string like "[0, 0, 1, ...]" with 1,433 binary ints.
-    # `np.fromstring` parses the comma-separated numbers (ast/json are not allowed imports).
+    # Each `features` is a string like "[0, 0, 1, ...]" with 1,433 binary ints.
+    # `np.fromstring` parses the comma-separated numbers into a 1D array
+    # `np.stack` combines all rows into a 2D array.
     feats = np.stack(
         [np.fromstring(s.strip("[]"), sep=",") for s in nodes_df["features"]]
     )
     x = torch.tensor(feats, dtype=torch.float)
-    # Row-normalize the bag-of-words features (standard preprocessing for Cora);
+    # Row-normalize the bag-of-words features 
     # gives a small, consistent accuracy boost and more margin above threshold.
     x = x / x.sum(dim=1, keepdim=True).clamp(min=1.0)
     return x
@@ -28,7 +23,7 @@ def get_feature_vectors(nodes_df):
 
 def get_edges(edges_df, inverse_node_id_mapping):
     """Return edge_index as a long torch.Tensor of shape [2, num_edges]."""
-    # Edges are keyed by original nodeId; remap both endpoints to internal indices.
+    # Edges are keyed by original nodeId,remap both endpoints to internal indices.
     src = edges_df["sourceNodeId"].map(inverse_node_id_mapping).to_numpy()
     dst = edges_df["targetNodeId"].map(inverse_node_id_mapping).to_numpy()
     return torch.tensor(np.vstack([src, dst]), dtype=torch.long)
@@ -45,14 +40,11 @@ class GraphSAGE(torch.nn.Module):
         super().__init__()
         torch.cuda.manual_seed(seed)
         torch.manual_seed(seed)
-        # Note: the framework passes data.x.shape[1] (the input dim, 1433) as
-        # `hidden_channels`, so this argument is the number of input features.
         in_dim = hidden_channels
         hidden = 256
         self.in_dim = in_dim
         self.output_dim = output_dim
         # With only 140 training nodes, heavier regularization generalizes best:
-        # input dropout + high hidden dropout gave the strongest worst-case seed.
         self.in_dropout = 0.3
         self.dropout = 0.7
         self.conv1 = SAGEConv(in_dim, hidden)

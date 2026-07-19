@@ -4,12 +4,12 @@ Student implementation file — submit this file only.
 Strategy overview
 -----------------
 1. Start from the 500 free initial labels.
-2. Batch-mode uncertainty sampling with diversity: repeatedly train the fixed
-   Random Forest, score all remaining pool candidates, take the most uncertain
-   region (predicted P(Left) closest to 0.5), cluster it, and query the most
-   uncertain sample per cluster — until the oracle budget is exhausted
-   (with runtime and budget guards). Diverse batches avoid spending budget on
-   near-duplicate borderline samples.
+2. Batch-mode uncertainty sampling: repeatedly train the fixed Random Forest,
+   score all remaining pool candidates, and query the samples whose predicted
+   P(Left) is closest to 0.5 — until the oracle budget is exhausted (with
+   runtime and budget guards). Cluster-diversity batches were evaluated and
+   rejected: the tiny local gain was not reproducible across scikit-learn
+   versions, while plain uncertainty selection is bit-for-bit deterministic.
 3. Rebalance for F1: the test metric is F1 of the minority "Left" class under
    model.predict() (0.5 vote threshold). Duplicating positive training rows
    shifts the effective threshold; the duplication ratio is chosen by repeated
@@ -25,7 +25,6 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedKFold
 
@@ -76,28 +75,6 @@ def _fit(X, y, ids, seed):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # duplicate-ID warning is expected
         return train_model(X, y, ids, seed=seed)
-
-
-def _select_diverse_batch(margin: np.ndarray, X_cand: pd.DataFrame, k: int, seed: int) -> np.ndarray:
-    """Pick k candidates: cluster the most uncertain region, one per cluster."""
-    if k >= len(margin):
-        return np.arange(len(margin))
-    top = np.argsort(margin, kind="stable")[: min(4 * k, len(margin))]
-    if k < 2 or len(top) <= k:
-        return top[:k]
-    km = MiniBatchKMeans(n_clusters=k, random_state=seed, n_init=3)
-    clusters = km.fit_predict(X_cand.iloc[top])
-    take = []
-    for c in range(k):
-        members = top[clusters == c]
-        if len(members):
-            take.append(members[np.argmin(margin[members])])
-    take = np.array(take, dtype=int)
-    if len(take) < k:  # backfill from the most uncertain not yet taken
-        taken = set(take.tolist())
-        extra = [i for i in top if i not in taken][: k - len(take)]
-        take = np.concatenate([take, np.array(extra, dtype=int)])
-    return take
 
 
 def _pick_dup_ratio(X, y, ids, seed: int) -> float:
@@ -161,7 +138,7 @@ def run_active_learning(seed: int):
         else:
             proba = np.zeros(len(X_cand))
         margin = np.abs(proba - 0.5)
-        take_idx = _select_diverse_batch(margin, X_cand, k, seed)
+        take_idx = np.argsort(margin, kind="stable")[:k]
 
         new_rows = call_oracle(list(cand_ids[take_idx]))
         labeled = pd.concat([labeled, new_rows], ignore_index=True)

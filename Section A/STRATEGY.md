@@ -23,7 +23,11 @@ The ceiling experiment (train on everything, sweep the threshold — `plots/fig1
 3. **Rebalance for F1:** duplicate the positive training rows (explicitly allowed by the assignment). The duplication ratio is chosen from {1.25 … 2.5} by **repeated 3-fold cross-validation on the labeled data only** — never the test set — so the choice adapts to the hidden data at grading time.
 4. **Final fit** on the 5,500 labeled rows + duplicated positives → return the model.
 
-Safety engineering for the hidden run: budget read from `get_oracle_usage()` (not hard-coded), batches capped to land exactly on budget, runtime guards (dump remaining budget in one batch after 30 s; skip the CV and use ratio 2.0 after 42 s), guard against degenerate single-class fits, deterministic per seed (verified: repeated runs give identical scores).
+Safety engineering for the hidden run: budget read from `get_oracle_usage()` (not hard-coded), batches capped to land exactly on budget, guard against degenerate single-class fits, deterministic per seed (verified: repeated runs give identical scores).
+
+**Runtime guard.** Fixed wall-clock thresholds cannot know how long the work they gate will take. The original guards (dump the budget after 30 s, skip the CV after 42 s) left a hole: on a machine 5.6–7.2× slower than ours, the pre-CV work finishes under 42 s, so the CV guard never fires — yet the CV itself then pushes the run past 60 s. Measured by scaling the deadline (work × *k* against 60 s ≡ work × 1 against 60/*k*), the old code busts at *k* = 5.6, 7, 15 and 25.
+
+The strategy now *measures* the cost of its own building blocks as it runs — one RF fit, one pool-scoring pass, one oracle label — and plans each remaining step against the deadline. Degradation order, cheapest sacrifice first: full batches → one bulk query → fewer queries (the learning curve plateaus near ~2,500 labels, so this costs little) → full CV grid → reduced grid → fixed ratio 2.0. Verified: no bust up to *k* = 25, with F1 decaying gracefully (k=15 → 0.629 on 3,882 queries; k=25 → 0.624 on 2,093). On a fast machine no cap binds and the queried-ID sets are bit-identical to the unguarded version.
 
 ## 3. What we tried — what worked
 

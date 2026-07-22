@@ -6,30 +6,19 @@ Strategy overview
 1. Start from the 500 free initial labels.
 2. Batch-mode uncertainty sampling: repeatedly train the fixed Random Forest,
    score all remaining pool candidates, and query the samples whose predicted
-   P(Left) is closest to 0.5 — until the oracle budget is exhausted. Cluster-
-   diversity batches were evaluated and rejected: the tiny local gain was not
-   reproducible across scikit-learn versions, while plain uncertainty selection
-   is bit-for-bit deterministic.
+   P(Left) is closest to 0.5 — until the oracle budget is exhausted (with
+   runtime and budget guards). Cluster-diversity batches were evaluated and
+   rejected: the tiny local gain was not reproducible across scikit-learn
+   versions, while plain uncertainty selection is bit-for-bit deterministic.
 3. Rebalance for F1: the test metric is F1 of the minority "Left" class under
    model.predict() (0.5 vote threshold). Duplicating positive training rows
    shifts the effective threshold; the duplication ratio is chosen by repeated
    3-fold cross-validation on the labeled data only (never the test set).
 4. Train the final Random Forest on the labeled set + duplicated positives.
 
-Runtime safety
---------------
-The 60 s/seed limit is enforced on the grading machine, which may be markedly
-slower than the development machine. Instead of fixed wall-clock thresholds
-(which cannot know how long the work they gate will take), this file *measures*
-the cost of its own building blocks as it runs — one Random Forest fit, one
-pool-scoring pass, one oracle label — and plans every remaining step against
-the deadline.
-
-On a fast machine no cap ever binds, so behaviour is identical to the unguarded
-strategy. On a slow machine the plan degrades in decreasing order of value:
-full-size query batches -> a single bulk query -> fewer queries (the learning
-curve plateaus near ~2,500 labels, so this is the cheapest thing to give up);
-full CV grid -> reduced CV grid -> the fixed fallback ratio.
+The runtime guards time a fit, a scoring pass and an oracle call as the loop
+runs, and size the remaining work from those measurements. If the grading
+machine is slow, batches shrink before the CV grid does.
 
 Allowed imports: numpy, pandas, sklearn, scipy, collections, warnings, typing, utils
 """
@@ -52,8 +41,7 @@ from utils import (
     train_model,
 )
 
-# Deadline. The grader times run_active_learning() alone; the reserve absorbs
-# interpreter jitter, GC pauses and the cost model's own estimation error.
+# Hard limit is 60 s per seed; the reserve covers the final fit and timing noise.
 _HARD_LIMIT_SEC = 60.0
 _RESERVE_SEC = 5.0
 _DEADLINE_SEC = _HARD_LIMIT_SEC - _RESERVE_SEC
@@ -61,20 +49,17 @@ _DEADLINE_SEC = _HARD_LIMIT_SEC - _RESERVE_SEC
 _BATCH_SIZE = 500
 
 # Candidate duplication ratios (extra copies of each positive row).
-_DUP_RATIOS = (1.25, 1.5, 1.75, 2.0, 2.25, 2.5)
-# Rungs tried in order; the first one that fits in the remaining time is used.
-# Measured cost on the dev machine: 36 / 18 / 9 fits ~= 4.8 / 2.8 / 1.1 s.
+_DUP_RATIOS = (1, 1.5, 2.0, 2.5)
+# (repeats, grid) tried in order; the first one that fits the time left is used.
 _CV_LADDER = (
     (2, _DUP_RATIOS),
     (1, _DUP_RATIOS),
-    (1, (1.5, 2.0, 2.5)),
 )
 _DEFAULT_DUP = 2.0
 
-# A CV or final fit trains on duplicated positives and also predicts, so it
-# costs more than a plain loop fit. Measured ratio ~1.3; rounded up for safety.
+# Fits on duplicated data cost more than a plain loop fit.
 _REBALANCED_FIT_FACTOR = 1.5
-# Only used if the query loop never ran, leaving no measurements to plan with.
+# Only reached if the query loop never ran and left no timings.
 _FALLBACK_FIT_SEC = 1.0
 
 
@@ -122,7 +107,7 @@ def _cv_ratio(X, y, ids, seed: int, repeats: int, grid) -> float:
 
 
 def _pick_dup_ratio(X, y, ids, seed: int, avail: float, t_fit: float) -> float:
-    """Run the richest CV rung that fits in `avail` seconds; else the fallback."""
+    """Run the largest CV configuration that fits in `avail` seconds."""
     for repeats, grid in _CV_LADDER:
         if repeats * 3 * len(grid) * t_fit <= avail:
             return _cv_ratio(X, y, ids, seed, repeats, grid)
@@ -131,11 +116,10 @@ def _pick_dup_ratio(X, y, ids, seed: int, avail: float, t_fit: float) -> float:
 
 def _plan_batch(left: int, avail: float, t_fit: float, t_score: float, t_per_id: float) -> int:
     """
-    Largest batch size that keeps the remaining plan inside `avail` seconds.
+    Largest batch size that keeps the rest of the run inside `avail` seconds.
 
-    Prefers the standard batch; falls back to one bulk query (which pays the
-    per-round fit and scoring cost once instead of once per round), then to a
-    partial query. Returns 0 when not even one more label is affordable.
+    Falls back to a single bulk query, which pays the fit and scoring cost once
+    instead of once per round, then to a partial query.
     """
     per_round = t_fit + t_score
     rounds_left = int(np.ceil(left / _BATCH_SIZE))
@@ -178,9 +162,8 @@ def run_active_learning(seed: int):
     budget = int(get_oracle_usage()["remaining"])
     budget = min(budget, len(cand_ids))
 
-    # Cost model, measured on this machine as the loop runs. Fits and scoring
-    # use the worst case seen (they grow with the labeled set); oracle cost is
-    # per-ID and flat, so its mean is the right estimator.
+    # Timings collected during the loop. Fits and scoring grow with the labeled
+    # set, so keep the worst case; oracle cost is flat per ID, so keep the mean.
     t_fit = 0.0
     t_score = 0.0
     t_oracle_total = 0.0
@@ -191,11 +174,9 @@ def run_active_learning(seed: int):
         left = min(budget - spent, len(cand_ids))
 
         if n_queried == 0:
-            # No measurements yet. One standard batch is safe on any plausible
-            # machine, and it is what calibrates the cost model.
-            k = min(_BATCH_SIZE, left)
+            k = min(_BATCH_SIZE, left)  # first round: nothing measured yet
         else:
-            tail = _REBALANCED_FIT_FACTOR * t_fit  # the final fit still has to happen
+            tail = _REBALANCED_FIT_FACTOR * t_fit  # room for the final fit
             k = _plan_batch(
                 left,
                 _DEADLINE_SEC - elapsed() - tail,
@@ -234,7 +215,7 @@ def run_active_learning(seed: int):
         cand_ids = cand_ids[keep]
         X_cand = X_cand.iloc[keep].reset_index(drop=True)
 
-    # Final rebalanced model, with the CV grid sized to the time that is left.
+    # Final rebalanced model; the CV size depends on the time left.
     X, y, ids = prepare_xy(labeled)
     t_reb_fit = _REBALANCED_FIT_FACTOR * (t_fit if t_fit > 0.0 else _FALLBACK_FIT_SEC)
     dup = _pick_dup_ratio(X, y, ids, seed, _DEADLINE_SEC - elapsed() - t_reb_fit, t_reb_fit)

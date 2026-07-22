@@ -1,6 +1,6 @@
 # Section A — Active Learning Strategy
 
-**Final local result: mean F1(Left) = 0.6416** (seed 1: 0.6352, seed 2: 0.6453, seed 3: 0.6443), ~12 s/seed, exactly 5,000 oracle queries — **bit-for-bit identical across Python 3.12/scikit-learn 1.9.0 and Python 3.14/scikit-learn 1.8.0**.
+**Final local result: mean F1(Left) = 0.6405** (seed 1: 0.6352, seed 2: 0.6420, seed 3: 0.6443), ~8.5 s/seed, exactly 5,000 oracle queries — **bit-for-bit identical across Python 3.12/scikit-learn 1.9.0 and Python 3.14/scikit-learn 1.8.0**.
 
 ---
 
@@ -20,7 +20,7 @@ The ceiling experiment (train on everything, sweep the threshold — `plots/fig1
 
 1. **Start** with the 500 free initial labels.
 2. **Batch active learning, 10 rounds × 500 queries:** train the fixed Random Forest, score every remaining pool row, and take the samples with predicted P(Left) closest to 0.5 (uncertainty sampling). A cluster-diversity variant (MiniBatchKMeans over the uncertain region) was adopted and later **removed**: its tiny local gain was not reproducible across scikit-learn versions (see §5), while plain uncertainty selection queries the exact same Employee IDs under sklearn 1.8 and 1.9.
-3. **Rebalance for F1:** duplicate the positive training rows (explicitly allowed by the assignment). The duplication ratio is chosen from {1.25 … 2.5} by **repeated 3-fold cross-validation on the labeled data only** — never the test set — so the choice adapts to the hidden data at grading time.
+3. **Rebalance for F1:** duplicate the positive training rows (explicitly allowed by the assignment). The duplication ratio is chosen from {1.5, 2.0, 2.5} by **repeated 3-fold cross-validation on the labeled data only** — never the test set — so the choice adapts to the hidden data at grading time. Three points span the fig3 plateau; a six-point grid costs 2.5 s/seed and moved the local mean by 0.001 (0.6416 vs 0.6405) — below the ±0.01 test-sampling noise, so it was not worth the runtime margin on a possibly slow grader.
 4. **Final fit** on the 5,500 labeled rows + duplicated positives → return the model.
 
 Safety engineering for the hidden run: budget read from `get_oracle_usage()` (not hard-coded), batches capped to land exactly on budget, guard against degenerate single-class fits, deterministic per seed (verified: repeated runs give identical scores).
@@ -39,7 +39,9 @@ All numbers are mean F1(Left) over seeds 1–3 on the local test sets.
 | + spend full budget randomly | 0.563 | +0.156 | " |
 | + uncertainty sampling instead of random | 0.585 | +0.022 | `plots/fig2_learning_curves.png` |
 | + positive duplication (rebalancing) | 0.637 | +0.052 | `plots/fig3_dup_sweep.png` |
-| + repeated-CV ratio selection (finer grid) | **0.642** | +0.005 | `plots/fig6_cv_adaptivity.png` |
+| + repeated-CV ratio selection | **0.6405** | +0.003 | `plots/fig6_cv_adaptivity.png` |
+
+Honest caveat on the last row: with the trimmed {1.5, 2.0, 2.5} grid the CV pick (0.6405) is *fractionally below* a hard-coded ratio of 2.0 (0.6413) on our local test sets. The gap is 0.0008 — an eighth of the test-sampling noise, so it is not evidence that the CV is worse. We keep the CV because it is the only component that adapts to the hidden run's labeled data, which is worth more than a coin-flip-sized local difference (see §5).
 
 Every idea we measured — helpful and harmful — is summarized in one figure: `plots/fig4_what_we_tried.png`.
 

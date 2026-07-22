@@ -44,7 +44,7 @@ _QUERY_TIME_LIMIT_SEC = 30.0
 _CV_TIME_LIMIT_SEC = 42.0
 _BATCH_SIZE = 500
 # Candidate duplication ratios (extra copies of each positive row).
-_DUP_RATIOS = (1.25, 1.5, 1.75, 2.0, 2.25, 2.5)
+_DUP_RATIOS = (0.75, 1.25, 1.5, 1.75, 2.0, 2.25)
 _DEFAULT_DUP = 2.0
 _CV_REPEATS = 2
 
